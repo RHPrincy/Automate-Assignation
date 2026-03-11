@@ -271,6 +271,35 @@ function calculateDueDate(legalFormCode, postalCode, siret, directorName, period
   return null;
 }
 
+/**
+ * Calcule la fin de période (endPeriode) à partir des dates de l'exercice fiscal
+ * et du numéro de période cible, exactement comme l'API le fait dans
+ * calculateMonthlyPeriods : dernier jour du mois calendaire, plafonné par endDate.
+ *
+ * @param {Date} startDate      - Date de début de l'exercice fiscal
+ * @param {Date} endDate        - Date de fin de l'exercice fiscal
+ * @param {number} targetPeriode - Numéro de la période cible (1–12)
+ * @returns {Date|null}
+ */
+function computeEndPeriode(startDate, endDate, targetPeriode) {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+
+  // Avancer mois par mois depuis startDate pour atteindre la période cible
+  let currentStart = new Date(start);
+  for (let p = 1; p < targetPeriode; p++) {
+    const lastDay = new Date(currentStart.getFullYear(), currentStart.getMonth() + 1, 0);
+    currentStart = new Date(lastDay.getFullYear(), lastDay.getMonth() + 1, 1);
+    if (currentStart >= end) return null; // Période hors de l'exercice
+  }
+
+  // Dernier jour du mois courant
+  const periodEnd = new Date(currentStart.getFullYear(), currentStart.getMonth() + 1, 0);
+
+  // Plafonner par la date de fin d'exercice
+  return periodEnd > end ? end : periodEnd;
+}
+
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │  4. REQUÊTES SQL                                                         │
 // └───────────────────────────────────────────────────────────────────────────┘
@@ -425,8 +454,19 @@ function printSummary(totalCopied, totalSkipped, totalErrors, totalNotified, sou
 // │  Si absent ou en erreur → l'insertion se fait quand même.               │
 // └───────────────────────────────────────────────────────────────────────────┘
 
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const SLACK_API_URL = process.env.SLACK_API_URL || 'https://slack.com/api';
+let SLACK_BOT_TOKEN = null;
+let SLACK_API_URL = 'https://slack.com/api';
+
+/** Initialise les variables Slack (à appeler après loadEnv). */
+function initSlack() {
+  SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || null;
+  SLACK_API_URL = process.env.SLACK_API_URL || 'https://slack.com/api';
+  if (SLACK_BOT_TOKEN) {
+    console.log('  💬 Slack activé (token trouvé)');
+  } else {
+    console.log('  💬 Slack désactivé (SLACK_BOT_TOKEN absent)');
+  }
+}
 
 /** Cache email → Slack userId pour éviter des appels API répétés. */
 const slackUserCache = new Map();
@@ -588,8 +628,15 @@ async function main() {
 
         // Calculer l'échéance pour les étapes finales
         let dueDate = null;
-        if (STEPS_WITH_DUE_DATE.includes(a.stepName) && fy.targetEndPeriode) {
-          dueDate = calculateDueDate(fy.legalFormCode, fy.postalCode, fy.siret, fy.directorName, fy.targetEndPeriode);
+        if (STEPS_WITH_DUE_DATE.includes(a.stepName)) {
+          // Utiliser targetEndPeriode de FiscalYearVATRegime si dispo,
+          // sinon calculer le dernier jour du mois cible à partir de l'exercice
+          const periodEnd = fy.targetEndPeriode
+            || computeEndPeriode(fy.startDate, fy.endDate, targetPeriode);
+
+          if (periodEnd) {
+            dueDate = calculateDueDate(fy.legalFormCode, fy.postalCode, fy.siret, fy.directorName, periodEnd);
+          }
         }
 
         const dueDateDisplay = dueDate ? toFrenchDate(dueDate) : '—';
@@ -656,6 +703,7 @@ async function main() {
 
 // ── Initialisation ──────────────────────────────────────────────────────────
 loadEnv();
+initSlack();
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
