@@ -21,6 +21,7 @@
  * ║    node index.js                  → Exécution réelle (mois courant)     ║
  * ║    node index.js --dry-run        → Simulation sans écriture            ║
  * ║    node index.js --periode 3      → Forcer le mois source (ex: mars)    ║
+ * ║    node index.js --update-dates   → Corriger les échéances manquantes   ║
  * ║                                                                         ║
  * ╚═══════════════════════════════════════════════════════════════════════════╝
  */
@@ -388,6 +389,55 @@ const SQL_INSERT_ASSIGNMENT = `
   VALUES (?, ?, ?, ?, ?, ?, NOW(), 'TODO', ?, 0)
 `;
 
+/**
+ * Requête 5 : Trouver les affectations TVA EM SANS date limite pour une période.
+ *
+ * Params : [targetPeriode, targetPeriode]
+ */
+const SQL_FIND_MISSING_DUEDATES = `
+  SELECT
+    a.taskId,
+    a.fiscalYearId,
+    a.vatPeriode,
+    a.assigneeId,
+    a.dueDate,
+    t.name        AS taskName,
+    s.name        AS stepName,
+    fy.startDate,
+    fy.endDate,
+    c.name        AS clientName,
+    c.siret,
+    c.postalCode,
+    c.legalFormCode,
+    c.directorName,
+    fyvr.endPeriode AS periodEndDate,
+    assignee.email  AS assigneeEmail
+  FROM Assignment a
+  JOIN Task t        ON t.id = a.taskId
+  JOIN Step s        ON s.id = t.stepId
+  JOIN Mission m     ON m.code = s.missionCode
+  JOIN FiscalYear fy ON fy.id = a.fiscalYearId
+  JOIN Client c      ON c.id = fy.clientId
+  LEFT JOIN FiscalYearVATRegime fyvr
+    ON  fyvr.fiscalYearId = fy.id
+    AND fyvr.periode = ?
+  LEFT JOIN User assignee ON assignee.id = a.assigneeId
+  WHERE a.vatPeriode = ?
+    AND a.dueDate IS NULL
+    AND m.code = 'TVA'
+    AND fy.isCurrent = 1
+  ORDER BY c.name, s.id, t.id
+`;
+
+/**
+ * Requête 6 : Mettre à jour la date limite d'une affectation.
+ *
+ * Params : [dueDate, taskId, fiscalYearId, vatPeriode]
+ */
+const SQL_UPDATE_DUEDATE = `
+  UPDATE Assignment SET dueDate = ? WHERE taskId = ? AND fiscalYearId = ? AND vatPeriode = ?
+`;
+
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │  5. UTILITAIRES D'AFFICHAGE                                              │
 // └───────────────────────────────────────────────────────────────────────────┘
@@ -549,10 +599,104 @@ async function notifySlackAssignment({ taskName, assigneeEmail, assignerName, as
 // │  7. SCRIPT PRINCIPAL                                                     │
 // └───────────────────────────────────────────────────────────────────────────┘
 
+/**
+ * Mode --update-dates : met à jour les affectations existantes qui n'ont pas
+ * de date limite (dueDate IS NULL) pour la période cible.
+ */
+async function updateDates(connection, targetPeriode, dryRun) {
+  console.log('');
+  console.log('╔═══════════════════════════════════════════════════════════════╗');
+  console.log('║  MISE À JOUR DES ÉCHÉANCES MANQUANTES                        ║');
+  console.log('╚═══════════════════════════════════════════════════════════════╝');
+  console.log('');
+  console.log('  📅 Période cible : ' + monthName(targetPeriode) + ' (période ' + targetPeriode + ')');
+  console.log('  🔧 Mode : ' + (dryRun ? '🔍 SIMULATION (dry-run)' : '✏️  ÉCRITURE RÉELLE en base'));
+  console.log('');
+
+  const [rows] = await connection.execute(SQL_FIND_MISSING_DUEDATES, [targetPeriode, targetPeriode]);
+
+  if (rows.length === 0) {
+    console.log('  ✅ Toutes les affectations ont déjà une date limite.');
+    return;
+  }
+
+  console.log('  📋 ' + rows.length + ' affectation(s) sans date limite\n');
+
+  let totalUpdated = 0;
+  let totalSkipped = 0;
+  let currentClient = null;
+
+  for (const r of rows) {
+    // Afficher l'en-tête client
+    if (r.clientName !== currentClient) {
+      if (currentClient) console.log('  └────────────────────────────────────\n');
+      currentClient = r.clientName;
+      console.log('  ┌─ 📁 ' + r.clientName);
+      console.log('  │  SIRET: ' + (r.siret || '—') + ' | Forme: ' + (r.legalFormCode || '—') + ' | CP: ' + (r.postalCode || '—'));
+    }
+
+    // Calculer la date limite
+    let dueDate = null;
+    if (STEPS_WITH_DUE_DATE.includes(r.stepName)) {
+      const periodEnd = r.periodEndDate
+        || computeEndPeriode(r.startDate, r.endDate, targetPeriode);
+      if (periodEnd) {
+        dueDate = calculateDueDate(r.legalFormCode, r.postalCode, r.siret, r.directorName, periodEnd);
+      }
+    }
+    // Pour les autres étapes, pas de source dueDate à décaler ici
+    // car on ne connaît pas l'ancienne date — on ne peut pas faire +1 mois
+
+    if (!dueDate) {
+      console.log('  │  ⏭️  ' + r.taskName + ' → impossible de calculer');
+      totalSkipped++;
+      continue;
+    }
+
+    const dueDateDisplay = toFrenchDate(dueDate);
+
+    if (dryRun) {
+      console.log('  │  🔍 ' + r.taskName + ' → ' + dueDateDisplay);
+      totalUpdated++;
+    } else {
+      try {
+        await connection.execute(SQL_UPDATE_DUEDATE, [
+          toMySQLDate(dueDate),
+          r.taskId,
+          r.fiscalYearId,
+          r.vatPeriode,
+        ]);
+        console.log('  │  ✅ ' + r.taskName + ' → ' + dueDateDisplay);
+        totalUpdated++;
+      } catch (err) {
+        console.error('  │  ❌ ' + r.taskName + ' → ' + err.message);
+      }
+    }
+  }
+
+  if (currentClient) console.log('  └────────────────────────────────────\n');
+
+  console.log('');
+  console.log('╔═══════════════════════════════════════════════════════════════╗');
+  console.log('║  RÉSUMÉ — MISE À JOUR ÉCHÉANCES                              ║');
+  console.log('╚═══════════════════════════════════════════════════════════════╝');
+  console.log('');
+  console.log('  ✅ Mises à jour  : ' + totalUpdated);
+  console.log('  ⏭️  Ignorées      : ' + totalSkipped);
+  console.log('  📅 Période : ' + monthName(targetPeriode));
+  if (dryRun) {
+    console.log('');
+    console.log('  ℹ️  Mode dry-run : aucune modification effectuée.');
+    console.log('     Relancez sans --dry-run pour exécuter réellement.');
+  }
+  console.log('');
+}
+
 async function main() {
   // ── Lire les arguments CLI ────────────────────────────────────────────
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
+  const updateDatesMode = args.includes('--update-dates');
   const periodeArgIdx = args.indexOf('--periode');
   const forcedPeriode = periodeArgIdx !== -1 ? parseInt(args[periodeArgIdx + 1], 10) : null;
 
@@ -566,13 +710,9 @@ async function main() {
     process.exit(0);
   }
 
-  printHeader(sourcePeriode, targetPeriode, dryRun);
-
   // ── Connexion à la base de données ────────────────────────────────────
   const dbConfig = parseDatabaseUrl(DATABASE_URL);
-
   console.log('  🔌 Connexion à ' + dbConfig.host + ':' + dbConfig.port + '/' + dbConfig.database + '…');
-
   const connection = await mysql.createConnection({
     host: dbConfig.host,
     port: dbConfig.port,
@@ -580,8 +720,19 @@ async function main() {
     password: dbConfig.password,
     database: dbConfig.database,
   });
+  console.log('  ✅ Connecté à la base de données');
 
-  console.log('  ✅ Connecté à la base de données\n');
+  // ── Mode --update-dates ───────────────────────────────────────────────
+  if (updateDatesMode) {
+    try {
+      await updateDates(connection, targetPeriode, dryRun);
+    } finally {
+      await connection.end();
+    }
+    return;
+  }
+
+  printHeader(sourcePeriode, targetPeriode, dryRun);
 
   try {
     // ── ÉTAPE 1 : Trouver les exercices fiscaux TVA EM ──────────────────
@@ -626,17 +777,20 @@ async function main() {
           continue;
         }
 
-        // Calculer l'échéance pour les étapes finales
+        // Calculer l'échéance
         let dueDate = null;
         if (STEPS_WITH_DUE_DATE.includes(a.stepName)) {
-          // Utiliser targetEndPeriode de FiscalYearVATRegime si dispo,
-          // sinon calculer le dernier jour du mois cible à partir de l'exercice
+          // Étapes finales : calcul fiscal (forme juridique, région, SIREN…)
           const periodEnd = fy.targetEndPeriode
             || computeEndPeriode(fy.startDate, fy.endDate, targetPeriode);
 
           if (periodEnd) {
             dueDate = calculateDueDate(fy.legalFormCode, fy.postalCode, fy.siret, fy.directorName, periodEnd);
           }
+        } else if (a.dueDate) {
+          // Autres étapes : reprendre la date du mois source + 1 mois, ajustée jours ouvrés
+          const srcDate = new Date(a.dueDate);
+          dueDate = adjustToNextWorkingDay(new Date(srcDate.getFullYear(), srcDate.getMonth() + 1, srcDate.getDate()));
         }
 
         const dueDateDisplay = dueDate ? toFrenchDate(dueDate) : '—';

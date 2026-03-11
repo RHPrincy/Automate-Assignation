@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dry-run": "node index.js --dry-run"
+    "dry-run": "node index.js --dry-run",
+    "update-dates": "node index.js --update-dates",
+    "update-dates:dry": "node index.js --update-dates --dry-run"
   },
   "dependencies": {
     "axios": "^1.13.6",
