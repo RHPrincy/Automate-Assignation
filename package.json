@@ -1,0 +1,13 @@
+{
+  "name": "copy-tva-em",
+  "version": "1.0.0",
+  "description": "Script indépendant pour copier les affectations TVA mensuelle EM vers le mois suivant",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dry-run": "node index.js --dry-run"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.0"
+  }
+}
