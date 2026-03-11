@@ -53,18 +53,20 @@ function loadEnv() {
     // Ignorer les lignes vides et les commentaires
     if (!trimmed || trimmed.startsWith('#')) continue;
 
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx === -1) continue;
+    // Supporter les deux formats : KEY=value et KEY: value
+    let separatorIdx = trimmed.indexOf('=');
+    if (separatorIdx === -1) separatorIdx = trimmed.indexOf(':');
+    if (separatorIdx === -1) continue;
 
-    const key = trimmed.slice(0, eqIdx).trim();
-    let val = trimmed.slice(eqIdx + 1).trim();
+    const key = trimmed.slice(0, separatorIdx).trim();
+    let val = trimmed.slice(separatorIdx + 1).trim();
 
     // Retirer les guillemets encadrants
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
     }
 
-    if (!process.env[key]) process.env[key] = val;
+    process.env[key] = val;
   }
 }
 
