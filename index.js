@@ -26,6 +26,7 @@
  */
 
 const mysql = require('mysql2/promise');
+const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 
@@ -319,13 +320,17 @@ const SQL_GET_ASSIGNMENTS = `
     a.assigneeId,
     a.reassigneeId,
     a.dueDate,
-    t.name  AS taskName,
-    s.name  AS stepName,
-    s.id    AS stepId
+    t.name        AS taskName,
+    s.name        AS stepName,
+    s.id          AS stepId,
+    assignee.email    AS assigneeEmail,
+    assigner.username AS assignerName
   FROM Assignment a
-  JOIN Task t    ON t.id = a.taskId
-  JOIN Step s    ON s.id = t.stepId
-  JOIN Mission m ON m.code = s.missionCode
+  JOIN Task t        ON t.id = a.taskId
+  JOIN Step s        ON s.id = t.stepId
+  JOIN Mission m     ON m.code = s.missionCode
+  LEFT JOIN User assignee  ON assignee.id = a.assigneeId
+  LEFT JOIN User assigner  ON assigner.id = a.assignerId
   WHERE a.fiscalYearId = ?
     AND a.vatPeriode = ?
     AND m.code = 'TVA'
@@ -389,7 +394,7 @@ function printHeader(sourcePeriode, targetPeriode, dryRun) {
   console.log('');
 }
 
-function printSummary(totalCopied, totalSkipped, totalErrors, sourcePeriode, targetPeriode, dryRun) {
+function printSummary(totalCopied, totalSkipped, totalErrors, totalNotified, sourcePeriode, targetPeriode, dryRun) {
   console.log('');
   console.log('╔═══════════════════════════════════════════════════════════════╗');
   console.log('║  RÉSUMÉ                                                      ║');
@@ -398,6 +403,7 @@ function printSummary(totalCopied, totalSkipped, totalErrors, sourcePeriode, tar
   console.log('  ✅ Copiées      : ' + totalCopied);
   console.log('  ⏭️  Ignorées     : ' + totalSkipped + ' (déjà existantes)');
   console.log('  ❌ Erreurs      : ' + totalErrors);
+  console.log('  💬 Notifiées    : ' + totalNotified + ' (Slack)');
   console.log('  📅 ' + monthName(sourcePeriode) + ' → ' + monthName(targetPeriode));
 
   if (dryRun) {
@@ -410,7 +416,97 @@ function printSummary(totalCopied, totalSkipped, totalErrors, sourcePeriode, tar
 }
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
-// │  6. SCRIPT PRINCIPAL                                                     │
+// │  6. NOTIFICATIONS SLACK                                                  │
+// │                                                                          │
+// │  Envoie un message direct (DM) à l'assignee via Slack                   │
+// │  quand une nouvelle affectation est créée (mode réel uniquement).        │
+// │                                                                          │
+// │  Nécessite SLACK_BOT_TOKEN dans le .env.                                │
+// │  Si absent ou en erreur → l'insertion se fait quand même.               │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const SLACK_API_URL = process.env.SLACK_API_URL || 'https://slack.com/api';
+
+/** Cache email → Slack userId pour éviter des appels API répétés. */
+const slackUserCache = new Map();
+
+/**
+ * Trouve le Slack userId à partir d'un email.
+ * Utilise l'API users.lookupByEmail. Résultat mis en cache.
+ */
+async function getSlackUserIdByEmail(email) {
+  if (!email || !SLACK_BOT_TOKEN) return null;
+  if (slackUserCache.has(email)) return slackUserCache.get(email);
+
+  try {
+    const res = await axios.get(SLACK_API_URL + '/users.lookupByEmail', {
+      params: { email },
+      headers: { Authorization: 'Bearer ' + SLACK_BOT_TOKEN },
+    });
+
+    if (!res.data.ok) return null;
+
+    const userId = res.data.user.id;
+    slackUserCache.set(email, userId);
+    return userId;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Envoie un DM Slack à un utilisateur identifié par email.
+ */
+async function sendSlackDM(email, message) {
+  const userId = await getSlackUserIdByEmail(email);
+  if (!userId) return false;
+
+  try {
+    // Ouvrir la conversation DM
+    const imRes = await axios.post(
+      SLACK_API_URL + '/conversations.open',
+      { users: userId },
+      { headers: { Authorization: 'Bearer ' + SLACK_BOT_TOKEN, 'Content-Type': 'application/json' } },
+    );
+
+    const channelId = imRes.data.channel.id;
+
+    // Envoyer le message
+    await axios.post(
+      SLACK_API_URL + '/chat.postMessage',
+      { channel: channelId, text: message },
+      { headers: { Authorization: 'Bearer ' + SLACK_BOT_TOKEN, 'Content-Type': 'application/json' } },
+    );
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Construit et envoie la notification Slack d'assignation.
+ * Format identique à celui de ec-mars-api (SlackService).
+ */
+async function notifySlackAssignment({ taskName, assigneeEmail, assignerName, assignedAt, dueDate, clientName }) {
+  const dateStr = assignedAt.toLocaleDateString('fr-FR') + ' à ' + assignedAt.toLocaleTimeString('fr-FR');
+
+  let message =
+    '*Assignation automatique de tache*\n\n' +
+    '> *Tache :* ' + taskName + '\n' +
+    '> *Dossier :* ' + clientName + '\n' +
+    '> *Date d\'assignation :* ' + dateStr + '\n';
+
+  if (dueDate) {
+    message += '> *Date limite :* ' + dueDate.toLocaleDateString('fr-FR') + '\n';
+  }
+
+  return sendSlackDM(assigneeEmail, message);
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │  7. SCRIPT PRINCIPAL                                                     │
 // └───────────────────────────────────────────────────────────────────────────┘
 
 async function main() {
@@ -461,6 +557,7 @@ async function main() {
     let totalCopied = 0;
     let totalSkipped = 0;
     let totalErrors = 0;
+    let totalNotified = 0;
 
     // ── ÉTAPE 2 : Boucler sur chaque exercice fiscal ────────────────────
     for (const fy of fiscalYears) {
@@ -516,6 +613,26 @@ async function main() {
 
             console.log('  │  ✅ ' + a.taskName + ' → échéance: ' + dueDateDisplay);
             totalCopied++;
+
+            // Notification Slack
+            if (SLACK_BOT_TOKEN && a.assigneeEmail) {
+              try {
+                const sent = await notifySlackAssignment({
+                  taskName: a.taskName,
+                  assigneeEmail: a.assigneeEmail,
+                  assignerName: a.assignerName || 'Système',
+                  assignedAt: new Date(),
+                  dueDate: dueDate || undefined,
+                  clientName: fy.clientName,
+                });
+                if (sent) {
+                  console.log('  │  💬 Slack → ' + a.assigneeEmail);
+                  totalNotified++;
+                }
+              } catch {
+                // Ne pas bloquer si Slack échoue
+              }
+            }
           } catch (err) {
             console.error('  │  ❌ ' + a.taskName + ' → ' + err.message);
             totalErrors++;
@@ -527,7 +644,7 @@ async function main() {
     }
 
     // ── Résumé final ────────────────────────────────────────────────────
-    printSummary(totalCopied, totalSkipped, totalErrors, sourcePeriode, targetPeriode, dryRun);
+    printSummary(totalCopied, totalSkipped, totalErrors, totalNotified, sourcePeriode, targetPeriode, dryRun);
 
   } catch (err) {
     console.error('\n❌ Erreur fatale :', err.message);
