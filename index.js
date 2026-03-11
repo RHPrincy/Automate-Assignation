@@ -643,9 +643,18 @@ async function updateDates(connection, targetPeriode, dryRun) {
       if (periodEnd) {
         dueDate = calculateDueDate(r.legalFormCode, r.postalCode, r.siret, r.directorName, periodEnd);
       }
+    } else {
+      // Autres étapes : chercher la dueDate de la même tâche en période source (+1 mois)
+      const sourcePeriode = targetPeriode - 1;
+      const [srcRows] = await connection.execute(
+        'SELECT dueDate FROM Assignment WHERE taskId = ? AND fiscalYearId = ? AND vatPeriode = ?',
+        [r.taskId, r.fiscalYearId, sourcePeriode],
+      );
+      if (srcRows.length > 0 && srcRows[0].dueDate) {
+        const srcDate = new Date(srcRows[0].dueDate);
+        dueDate = adjustToNextWorkingDay(new Date(srcDate.getFullYear(), srcDate.getMonth() + 1, srcDate.getDate()));
+      }
     }
-    // Pour les autres étapes, pas de source dueDate à décaler ici
-    // car on ne connaît pas l'ancienne date — on ne peut pas faire +1 mois
 
     if (!dueDate) {
       console.log('  │  ⏭️  ' + r.taskName + ' → impossible de calculer');
